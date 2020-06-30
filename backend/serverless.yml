@@ -1,0 +1,236 @@
+service:
+  name: serverless-todo-app
+
+plugins:
+  - serverless-webpack
+  - serverless-iam-roles-per-function
+
+provider:
+  name: aws
+  runtime: nodejs12.x
+
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-2'}
+
+  tracing:
+    lambda: true
+    apiGateway: true
+
+  environment:
+    ITEMS_TABLE: Items-${self:provider.stage}
+    USER_ID_INDEX: UserIdIndex
+    IMAGES_S3_BUCKET: todo-app-arbi-images-${self:provider.stage}
+    SIGNED_URL_EXPIRATION: 300
+
+custom:
+  documentation:
+    api:
+      info:
+        version: v1.0.0
+        title: Serverless Grocery List application API
+        description: Serverless Grocery List application API
+    models:
+      - name: CreateTodoRequest
+        contentType: application/json
+        schema: ${file(src/models/create-todo-request.json)}
+      - name: UpdateTodoRequest
+        contentType: application/json
+        schema: ${file(src/models/update-todo-request.json)}   
+
+functions:
+
+  Auth:
+    handler: src/lambda/auth/auth0Authorizer.handler
+
+  GetTodos:
+    handler: src/lambda/http/getTodos.handler
+    events:
+      - http:
+          method: get
+          path: items
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.ITEMS_TABLE}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.ITEMS_TABLE}/index/${self:provider.environment.USER_ID_INDEX}
+      - Effect: Allow
+        Action:
+          - xray:PutTelemetryRecords
+          - xray:PutTraceSegments
+        Resource: "*"
+
+  CreateTodo:
+    handler: src/lambda/http/createTodo.handler
+    events:
+      - http:
+          method: post
+          path: items
+          cors: true
+          authorizer: Auth
+          request:
+            schema:
+              application/json: ${file(src/models/create-todo-request.json)}   
+          
+    deploymentSettings:
+      type: Linear10PercentEvery1Minute
+      alias: Live
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.ITEMS_TABLE}
+      - Effect: Allow
+        Action:
+          - xray:PutTelemetryRecords
+          - xray:PutTraceSegments
+        Resource: "*"
+
+  UpdateTodo:
+    handler: src/lambda/http/updateTodo.handler
+    events:
+      - http:
+          method: patch
+          path: items/{itemId}
+          cors: true
+          authorizer: Auth
+          request:
+            schema:
+              application/json: ${file(src/models/update-todo-request.json)}   
+          reqValidatorName: RequestBodyValidator
+          documentation:
+            summary: Update todo
+            description: Update todo
+            requestModels:
+              'application/json': UpdateTodoRequest
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.ITEMS_TABLE}
+      - Effect: Allow
+        Action:
+          - xray:PutTelemetryRecords
+          - xray:PutTraceSegments
+        Resource: "*"
+
+  DeleteTodo:
+    handler: src/lambda/http/deleteTodo.handler
+    events:
+      - http:
+          method: delete
+          path: items/{itemId}
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:DeleteItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.ITEMS_TABLE}
+      - Effect: Allow
+        Action:
+          - xray:PutTelemetryRecords
+          - xray:PutTraceSegments
+        Resource: "*"
+
+  GenerateUploadUrl:
+    handler: src/lambda/http/generateUploadUrl.handler
+    events:
+      - http:
+          method: post
+          path: items/{itemId}/attachment
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.ITEMS_TABLE}
+      - Effect: Allow
+        Action:
+          - s3:PutObject
+          - s3:GetObject
+        Resource: arn:aws:s3:::${self:provider.environment.IMAGES_S3_BUCKET}/*
+      - Effect: Allow
+        Action:
+          - xray:PutTelemetryRecords
+          - xray:PutTraceSegments
+        Resource: "*"
+
+resources:
+  Resources:
+    GatewayResponseDefault4XX:
+      Type: AWS::ApiGateway::GatewayResponse
+      Properties:
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+          gatewayresponse.header.Access-Control-Allow-Methods: "'GET,OPTIONS,POST'"
+        ResponseType: DEFAULT_4XX
+        RestApiId:
+          Ref: ApiGatewayRestApi
+
+    TodosDynamoDBTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: createdAt
+            AttributeType: S
+          - AttributeName: itemId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: itemId
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.ITEMS_TABLE}
+        GlobalSecondaryIndexes:
+          - IndexName: ${self:provider.environment.USER_ID_INDEX}
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+              - AttributeName: createdAt
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+
+    
+    AttachmentsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.IMAGES_S3_BUCKET}
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins:
+                - "*"
+              AllowedHeaders:
+                - "*"
+              AllowedMethods:
+                - GET
+                - PUT
+                - POST
+                - DELETE
+                - HEAD
+              MaxAge: 3000
+
+    BucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        PolicyDocument:
+          Id: MyPolicy
+          Version: "2012-10-17"
+          Statement:
+            - Sid: PublicReadForGetBucketObjects
+              Effect: Allow
+              Principal: "*"
+              Action: "s3:GetObject"
+              Resource: "arn:aws:s3:::${self:provider.environment.IMAGES_S3_BUCKET}/*"
+        Bucket: !Ref AttachmentsBucket
